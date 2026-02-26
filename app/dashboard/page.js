@@ -1,128 +1,40 @@
-import { createServerClient } from '@supabase/ssr'
-import { cookies } from 'next/headers'
+import { createSupabaseServer } from '@/lib/supabase-server'
 import { redirect } from 'next/navigation'
+import { theme } from '@/lib/theme'
+import { addTask, toggleTask, deleteTask } from './actions'
 
-const theme = {
-  // Page
-  pageBg: 'bg-black',
-  pageText: 'text-white',
-  
-  // Cards
-  cardBg: 'bg-white',
-  cardHeading: 'text-gray-400',
-  cardTextMuted: 'text-gray-400',
-  cardText: 'text-gray-800',
-  
-  // Buttons
-  buttonPrimary: 'bg-blue-500 text-white',
-  buttonDanger: 'text-red-400 hover:text-red-600',
-  
-  // Progress/Heatmap
-  progressBar: 'bg-green-500',
-  progressSuccess: 'text-green-600',
-  heatmapEmpty: 'bg-gray-100',
-  heatmapLow: 'bg-red-200',
-  heatmapMed: 'bg-green-400',
-  heatmapHigh: 'bg-green-600',
-  
-  // Inputs
-  inputBorder: 'border',
-  inputBg: 'bg-white',
+function decodeHtml(text) {
+  return text
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#039;/g, "'")
+    .replace(/&apos;/g, "'")
 }
 
 export default async function DashboardPage() {
-  const cookieStore = await cookies()
-  const supabase = createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
-    {
-      cookies: {
-        getAll: () => cookieStore.getAll(),
-        setAll: (cookies) => cookies.forEach(({ name, value, options }) =>
-          cookieStore.set(name, value, options)
-        ),
-      },
-    }
-  )
+  const supabase = await createSupabaseServer()
 
   const { data: { user } } = await supabase.auth.getUser()
   if (!user) redirect('/login')
-
-  async function addTask(formData) {
-    'use server'
-    const title = formData.get('title')
-    const cookieStore = await cookies()
-    const supabase = createServerClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL,
-      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
-      {
-        cookies: {
-          getAll: () => cookieStore.getAll(),
-          setAll: (cookies) => cookies.forEach(({ name, value, options }) =>
-            cookieStore.set(name, value, options)
-          ),
-        },
-      }
-    )
-    await supabase.from('tasks').insert({ title, user_id: user.id })
-    redirect('/dashboard')
-  }
-
-  async function toggleTask(formData) {
-    'use server'
-    const id = formData.get('id')
-    const completed = formData.get('completed') === 'true'
-    const cookieStore = await cookies()
-    const supabase = createServerClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL,
-      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
-      {
-        cookies: {
-          getAll: () => cookieStore.getAll(),
-          setAll: (cookies) => cookies.forEach(({ name, value, options }) =>
-            cookieStore.set(name, value, options)
-          ),
-        },
-      }
-    )
-    
-    const newCompleted = !completed
-    await supabase
-      .from('tasks')
-      .update({ 
-        completed: newCompleted,
-        completed_at: newCompleted ? new Date().toISOString() : null
-      })
-      .eq('id', id)
-    
-    redirect('/dashboard')
-  }
-
-  async function deleteTask(formData) {
-    'use server'
-    const id = formData.get('id')
-    const cookieStore = await cookies()
-    const supabase = createServerClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL,
-      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
-      {
-        cookies: {
-          getAll: () => cookieStore.getAll(),
-          setAll: (cookies) => cookies.forEach(({ name, value, options }) =>
-            cookieStore.set(name, value, options)
-          ),
-        },
-      }
-    )
-    await supabase.from('tasks').delete().eq('id', id)
-    redirect('/dashboard')
-  }
 
   const { data: tasks } = await supabase
     .from('tasks')
     .select('*')
     .eq('user_id', user.id)
     .order('created_at', { ascending: true })
+
+    // Fetch NPR news
+    const newsResponse = await fetch('https://feeds.npr.org/1001/rss.xml', { next: { revalidate: 3600 } })
+    const newsXml = await newsResponse.text()
+    const newsItems = [...newsXml.matchAll(/<item>[\s\S]*?<title>([^<]+)<\/title>[\s\S]*?<link>([^<]+)<\/link>[\s\S]*?<\/item>/g)]
+      .slice(0, 5)
+      .map(match => ({ title: decodeHtml(match[1]), link: match[2] }))
+
+  const today = new Date().toISOString().split('T')[0]
+  const completedToday = tasks?.filter(t => t.completed_at?.startsWith(today)).length || 0
+  const goal = 5
 
   return (
     <div className={`min-h-screen ${theme.pageBg} ${theme.pageText} p-8`}>
@@ -136,6 +48,7 @@ export default async function DashboardPage() {
           <h2 className={`text-lg font-semibold ${theme.cardHeading}`}>Tasks</h2>
           
           <form action={addTask} className="mb-4 flex gap-2">
+            <input type="hidden" name="userId" value={user.id} />
             <input
               type="text"
               name="title"
@@ -184,8 +97,26 @@ export default async function DashboardPage() {
 
         {/* News Card */}
         <div className={`${theme.cardBg} rounded-lg shadow p-6`}>
-          <h2 className={`text-lg font-semibold ${theme.cardHeading} mb-4`}>News</h2>
-          <p className={`${theme.cardTextMuted} text-sm`}>Coming soon...</p>
+          <h2 className={`text-lg font-semibold ${theme.cardHeading} mb-4`}>NPR News</h2>
+          {newsItems.length === 0 ? (
+            <p className={`${theme.cardTextMuted} text-sm`}>Unable to load news.</p>
+          ) : (
+            <ul className="space-y-3">
+              {newsItems.map((item, i) => (
+                <li key={i}>
+                  <a 
+                    href={item.link} 
+                    target="_blank" 
+                    rel="noopener noreferrer"
+                    className={`text-sm ${theme.cardText} hover:underline`}
+                  >
+                    {/*Actual Title: (add the "NPR: " idea*/}
+                    {item.title}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
 
         {/* Heatmap Card */}
@@ -196,22 +127,13 @@ export default async function DashboardPage() {
               const date = new Date()
               date.setDate(date.getDate() - (13 - i))
               const dateStr = date.toISOString().split('T')[0]
-              
-              const count = tasks?.filter(task => 
-                task.completed_at?.startsWith(dateStr)
-              ).length || 0
-              
+              const count = tasks?.filter(t => t.completed_at?.startsWith(dateStr)).length || 0
               const intensity = count === 0 ? theme.heatmapEmpty
                 : count === 1 ? theme.heatmapLow
                 : count === 2 ? theme.heatmapMed
                 : theme.heatmapHigh
-              
               return (
-                <div
-                  key={i}
-                  className={`aspect-square rounded ${intensity}`}
-                  title={`${dateStr}: ${count} tasks`}
-                />
+                <div key={i} className={`aspect-square rounded ${intensity}`} title={`${dateStr}: ${count} tasks`} />
               )
             })}
           </div>
@@ -224,32 +146,19 @@ export default async function DashboardPage() {
         {/* Daily Goal Card */}
         <div className={`${theme.cardBg} rounded-lg shadow p-6`}>
           <h2 className={`text-lg font-semibold ${theme.cardHeading} mb-4`}>Today's Progress</h2>
-          {(() => {
-            const today = new Date().toISOString().split('T')[0]
-            const completedToday = tasks?.filter(task => 
-              task.completed_at?.startsWith(today)
-            ).length || 0
-            const goal = 5
-            const percentage = Math.min((completedToday / goal) * 100, 100)
-            
-            return (
-              <div>
-                <div className={`flex justify-between text-sm mb-2 ${theme.cardText}`}>
-                  <span>{completedToday} of {goal} tasks</span>
-                  <span>{Math.round(percentage)}%</span>
-                </div>
-                <div className={`w-full ${theme.heatmapEmpty} rounded-full h-4`}>
-                  <div 
-                    className={`${theme.progressBar} h-4 rounded-full transition-all`}
-                    style={{ width: `${percentage}%` }}
-                  />
-                </div>
-                {completedToday >= goal && (
-                  <p className={`${theme.progressSuccess} text-sm mt-2`}>🎉 Goal reached!</p>
-                )}
-              </div>
-            )
-          })()}
+          <div className={`flex justify-between text-sm mb-2 ${theme.cardText}`}>
+            <span>{completedToday} of {goal} tasks</span>
+            <span>{Math.round(Math.min((completedToday / goal) * 100, 100))}%</span>
+          </div>
+          <div className={`w-full ${theme.heatmapEmpty} rounded-full h-4`}>
+            <div 
+              className={`${theme.progressBar} h-4 rounded-full transition-all`}
+              style={{ width: `${Math.min((completedToday / goal) * 100, 100)}%` }}
+            />
+          </div>
+          {completedToday >= goal && (
+            <p className={`${theme.progressSuccess} text-sm mt-2`}>🎉 Goal reached!</p>
+          )}
         </div>
       </div>
     </div>
