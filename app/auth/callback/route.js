@@ -7,11 +7,6 @@ export async function GET(request) {
   const response = NextResponse.redirect(new URL('/dashboard', request.url))
 
   if (code) {
-    console.log('code:', code)
-    const { data, error } = await supabase.auth.exchangeCodeForSession(code)
-    console.log('session data:', data)
-    console.log('session error:', error)
-    
     const supabase = createServerClient(
       process.env.NEXT_PUBLIC_SUPABASE_URL,
       process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
@@ -24,7 +19,10 @@ export async function GET(request) {
         },
       }
     )
-    await supabase.auth.exchangeCodeForSession(code)
+    
+    const { data, error } = await supabase.auth.exchangeCodeForSession(code)
+    console.log('session data:', data)
+    if (error) console.error('session error:', error)
   }
 
   return response
