@@ -1,7 +1,9 @@
 import { createSupabaseServer } from '@/lib/supabase-server'
 import { redirect } from 'next/navigation'
 import AssignmentModal from './AssignmentModal'
-import { deleteAssignment } from './actions'
+import AvailabilityEditor from './AvailabilityEditor'
+import { deleteAssignment, generateSchedule } from './actions'
+import ScheduleView from './ScheduleView'
 
 
 export default async function SchedulerPage() {
@@ -17,9 +19,25 @@ export default async function SchedulerPage() {
     .eq('user_id', user.id)
     .order('due_date', { ascending: true })
 
+  // Fetch availability blocks
+  const { data: availabilityBlocks } = await supabase
+    .from('availability_blocks')
+    .select('*')
+    .eq('user_id', user.id)
+    .order('start_time', { ascending: true })
+
+  // Fetch work sessions
+  const { data: workSessions } = await supabase
+    .from('work_sessions')
+    .select('*, assignments(title)')
+    .eq('user_id', user.id)
+    .order('scheduled_date', { ascending: true })
+    .order('start_time', { ascending: true })
+
   return (
     <div className="min-h-screen bg-white p-8">
       <div className="flex justify-between items-center mb-6">
+        
         <div>
           <h1 className="text-2xl font-bold text-slate-700">
             Scheduler
@@ -28,8 +46,19 @@ export default async function SchedulerPage() {
             Welcome, {user.user_metadata.full_name}
           </p>
         </div>
-        
-        <AssignmentModal userId={user.id} />
+
+        <div className="flex items-center gap-3">
+          <form action={generateSchedule}>
+            <input type="hidden" name="userId" value={user.id} />
+            <button
+              type="submit"
+              className="bg-slate-700 text-white px-4 py-2 rounded-lg hover:bg-slate-800"
+            >
+              Generate Schedule
+            </button>
+          </form>
+          <AssignmentModal userId={user.id} />
+        </div>
       </div>
 
       {/* Assignments list */}
@@ -80,6 +109,10 @@ export default async function SchedulerPage() {
           </div>
         )}
       </div>
+
+        <AvailabilityEditor userId={user.id} blocks={availabilityBlocks || []} />
+        <ScheduleView sessions={workSessions || []} />
+
     </div>
   )
 }
