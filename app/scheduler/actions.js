@@ -3,16 +3,18 @@
 import { createSupabaseServer } from '@/lib/supabase-server'
 import { redirect } from 'next/navigation'
 
+// --- ASSIGNMENT ACTIONS ---
+
 export async function addAssignment(formData) {
   const supabase = await createSupabaseServer()
-  
+
   const { error } = await supabase.from('assignments').insert({
     user_id: formData.get('userId'),
     title: formData.get('title'),
     assignment_type: formData.get('assignmentType') || null,
     due_date: formData.get('dueDate'),
     estimated_hours: parseFloat(formData.get('estimatedHours')),
-    status: 'not_started'
+    status: 'not_started',
   })
 
   if (error) {
@@ -24,7 +26,7 @@ export async function addAssignment(formData) {
 
 export async function deleteAssignment(formData) {
   const supabase = await createSupabaseServer()
-  
+
   const { error } = await supabase
     .from('assignments')
     .delete()
@@ -36,6 +38,8 @@ export async function deleteAssignment(formData) {
 
   redirect('/scheduler')
 }
+
+// --- AVAILABILITY ACTIONS ---
 
 export async function addAvailabilityBlock(formData) {
   const supabase = await createSupabaseServer()
@@ -69,14 +73,81 @@ export async function deleteAvailabilityBlock(formData) {
   redirect('/scheduler')
 }
 
+// --- SESSION ACTIONS ---
+
+// Updates a single session — kept for backward compatibility
+export async function updateSessionStatus(formData) {
+  const supabase = await createSupabaseServer()
+
+  const { error } = await supabase
+    .from('work_sessions')
+    .update({ status: formData.get('status') })
+    .eq('id', formData.get('id'))
+
+  if (error) {
+    console.error('Failed to update session:', error)
+  }
+
+  redirect('/scheduler')
+}
+
+// Updates all sessions in a consolidated block at once.
+// Receives a comma-separated string of session IDs.
+export async function updateBlockStatus(formData) {
+  const supabase = await createSupabaseServer()
+  const ids = formData.get('ids').split(',')
+  const status = formData.get('status')
+
+  // Update the sessions
+  const { data: updatedSessions, error } = await supabase
+    .from('work_sessions')
+    .update({ status })
+    .in('id', ids)
+    .select('assignment_id')
+
+  if (error) {
+    console.error('Failed to update block:', error)
+    redirect('/scheduler')
+    return
+  }
+
+  // Update assignment status based on session progress
+  const assignmentId = updatedSessions?.[0]?.assignment_id
+  if (assignmentId) {
+    const { data: allSessions } = await supabase
+      .from('work_sessions')
+      .select('status')
+      .eq('assignment_id', assignmentId)
+
+    if (allSessions) {
+      const total = allSessions.length
+      const completed = allSessions.filter(s => s.status === 'completed').length
+
+      let assignmentStatus = 'not_started'
+      if (completed >= total) {
+        assignmentStatus = 'complete'
+      } else if (completed > 0) {
+        assignmentStatus = 'in_progress'
+      }
+
+      await supabase
+        .from('assignments')
+        .update({ status: assignmentStatus })
+        .eq('id', assignmentId)
+    }
+  }
+
+  redirect('/scheduler')
+}
+
+// --- SCHEDULE GENERATION ---
+// Config constants — change these to adjust scheduling behavior
+const SESSION_MINUTES = 30
+const MAX_CONSECUTIVE = 2 // 2 × 30 min = 1 hour before switching assignments
+
 export async function generateSchedule(formData) {
   const supabase = await createSupabaseServer()
   const userId = formData.get('userId')
-
-  // --- CONFIG (easy to change later) ---
-  const SESSION_MINUTES = 30
-  const MAX_CONSECUTIVE = 4   // 4 × 30 min = 2 hours
-  const BREAK_SLOTS = 1       // 1 × 30 min = 30-min break
 
   // --- FETCH INPUTS ---
   const { data: assignments } = await supabase
@@ -96,15 +167,39 @@ export async function generateSchedule(formData) {
     return
   }
 
-  console.log('Assignments found:', assignments?.length)
-  console.log('Availability blocks found:', availabilityBlocks?.length)
+  // --- ACCOUNT FOR ALREADY-COMPLETED SESSIONS ---
+  const { data: completedSessions } = await supabase
+    .from('work_sessions')
+    .select('assignment_id')
+    .eq('user_id', userId)
+    .eq('status', 'completed')
+
+  const completedCounts = {}
+  for (const session of completedSessions || []) {
+    completedCounts[session.assignment_id] = (completedCounts[session.assignment_id] || 0) + 1
+  }
+
+  const assignmentQueue = assignments
+    .map((a) => ({
+      ...a,
+      sessions_remaining: Math.max(
+        0,
+        Math.ceil(a.estimated_hours * 2) - (completedCounts[a.id] || 0)
+      ),
+    }))
+    .filter((a) => a.sessions_remaining > 0)
+
+  if (assignmentQueue.length === 0) {
+    redirect('/scheduler')
+    return
+  }
 
   // --- PHASE 1: BUILD SLOT GRID ---
   const today = new Date()
   today.setHours(0, 0, 0, 0)
 
   const furthestDeadline = new Date(
-    Math.max(...assignments.map(a => new Date(a.due_date).getTime()))
+    Math.max(...assignmentQueue.map((a) => new Date(a.due_date).getTime()))
   )
 
   const slots = []
@@ -116,7 +211,7 @@ export async function generateSchedule(formData) {
   ) {
     const dateStr = d.toISOString().split('T')[0]
     const dayOfWeek = d.getDay()
-    const dayBlocks = availabilityBlocks.filter(b => b.day_of_week === dayOfWeek)
+    const dayBlocks = availabilityBlocks.filter((b) => b.day_of_week === dayOfWeek)
 
     for (const block of dayBlocks) {
       const [startH, startM] = block.start_time.split(':').map(Number)
@@ -141,64 +236,49 @@ export async function generateSchedule(formData) {
     }
   }
 
-  console.log('Total slots generated:', slots.length)
+  // --- PHASE 2: ROUND-ROBIN FILL ---
+  let currentIdx = 0
+  let consecutive = 0
 
-  // --- PHASE 2: FILL SLOTS (earliest deadline first) ---
-  for (const assignment of assignments) {
-    const sessionsNeeded = Math.ceil(assignment.estimated_hours * 2)
-    let sessionsPlaced = 0
-    let consecutive = 0
-    let skipUntilIndex = -1
-    // Track last placed slot to detect adjacency
-    let lastDate = null
-    let lastEnd = null
+  for (let i = 0; i < slots.length; i++) {
+    const slot = slots[i]
+    const queueLen = assignmentQueue.length
 
-    for (let i = 0; i < slots.length && sessionsPlaced < sessionsNeeded; i++) {
-      const slot = slots[i]
+    for (let attempt = 0; attempt < queueLen; attempt++) {
+      const candidate = assignmentQueue[(currentIdx + attempt) % queueLen]
 
-      // Must be before due date
-      if (slot.date >= assignment.due_date) continue
+      if (candidate.sessions_remaining <= 0) continue
+      if (slot.date >= candidate.due_date) continue
 
-      // Already claimed by a higher-priority assignment
-      if (slot.assigned_to !== null) {
+      const actualIdx = (currentIdx + attempt) % queueLen
+      if (attempt > 0) {
+        currentIdx = actualIdx
         consecutive = 0
-        continue
       }
 
-      // In the break zone after hitting the 2-hour cap
-      if (i <= skipUntilIndex) continue
+      slot.assigned_to = candidate.id
+      candidate.sessions_remaining--
+      consecutive++
 
-      // Check if this slot is adjacent to the last one we placed
-      const isAdjacent = (slot.date === lastDate && slot.start_time === lastEnd)
-      consecutive = isAdjacent ? consecutive + 1 : 1
-
-      // Place the session
-      slot.assigned_to = assignment.id
-      sessionsPlaced++
-      lastDate = slot.date
-      lastEnd = slot.end_time
-
-      // If we just hit the cap, enforce a break
       if (consecutive >= MAX_CONSECUTIVE) {
-        skipUntilIndex = i + BREAK_SLOTS
+        currentIdx = (currentIdx + 1) % queueLen
         consecutive = 0
       }
+
+      break
     }
   }
 
   // --- PHASE 3: WRITE TO DATABASE ---
-  // Clear old scheduled sessions (keeps completed ones intact)
   await supabase
     .from('work_sessions')
     .delete()
     .eq('user_id', userId)
-    .eq('status', 'upcoming')
+    .in('status', ['upcoming', 'completed', 'skipped'])
 
-
-  // Build rows from filled slots
   const newSessions = slots
-    .filter(s => s.assigned_to !== null)
-    .map(s => ({
+    .filter((s) => s.assigned_to !== null)
+    .map((s) => ({
       user_id: userId,
       assignment_id: s.assigned_to,
       scheduled_date: s.date,
@@ -210,21 +290,6 @@ export async function generateSchedule(formData) {
   if (newSessions.length > 0) {
     const { error } = await supabase.from('work_sessions').insert(newSessions)
     if (error) console.error('Failed to create sessions:', error)
-  }
-
-  redirect('/scheduler')
-}
-
-export async function updateSessionStatus(formData) {
-  const supabase = await createSupabaseServer()
-
-  const { error } = await supabase
-    .from('work_sessions')
-    .update({ status: formData.get('status') })
-    .eq('id', formData.get('id'))
-
-  if (error) {
-    console.error('Failed to update session:', error)
   }
 
   redirect('/scheduler')
